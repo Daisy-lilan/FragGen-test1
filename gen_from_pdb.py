@@ -24,7 +24,8 @@ import argparse
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='./configs/sample_dihedral.yml')
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='auto',
+                        help='auto | cpu | cuda | cuda:N')
     parser.add_argument('--surf_file', type=str, default='./data/crosssdock_test/4tos_A_rec_4tos_355_lig_tt_min_0/4tos_A_rec_4tos_355_lig_tt_min_0_pocket_8.0_res_1.5.ply',
                             help='surface file, generate basded on this')
     parser.add_argument('--pdb_file', type=str, default='./data/crosssdock_test/4tos_A_rec_4tos_355_lig_tt_min_0/4tos_A_rec.pdb')
@@ -46,8 +47,12 @@ if __name__ == '__main__':
 
     config = load_config(args.config)
 
-    resolved_device = args.device
-    if args.device.startswith('cuda') and not torch.cuda.is_available():
+    if args.device == 'auto':
+        resolved_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        resolved_device = args.device
+
+    if resolved_device.startswith('cuda') and not torch.cuda.is_available():
         print('[Warn] CUDA is not available. Falling back to CPU for sampling.')
         resolved_device = 'cpu'
     
