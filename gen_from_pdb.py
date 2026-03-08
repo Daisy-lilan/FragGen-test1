@@ -17,6 +17,7 @@ from utils.transform import FeaturizeProteinAtom, FeaturizeLigandAtom, \
 from models.IDGaF import FragmentGeneration
 from utils.sample_utils import pdb_to_pocket_data, add_next_mol2data, select_data_with_limited_smi, ply_to_pocket_data
 from utils.sample import get_init, get_init_only_frag, get_next
+from utils.dataset import ComplexData
 from rdkit import Chem
 import argparse
 
@@ -33,6 +34,12 @@ if __name__ == '__main__':
                             help='provide center explcitly, e.g., "32.33,25.56,45.67", where , is used to split x y z coordinates')
     parser.add_argument('--frag_base', type=str, default='./data/fragment_base.pkl')
     parser.add_argument('--save_dir', type=str, default='./output')
+    parser.add_argument('--target_pos', type=str, default=None,
+                        help='Target endpoint (Frag B) center, format: "x,y,z"')
+    parser.add_argument('--guidance_lambda', type=float, default=2.0,
+                        help='Weight for distance guidance term: p_guided = p_all + lambda / distance')
+    parser.add_argument('--target_finish_dist', type=float, default=1.5,
+                        help='Beam is marked finished once min distance to target is below this threshold (Angstrom)')
     args = parser.parse_args()
     print('Thanks to use the SurfFrag!')
     print('If you do not assign the sdf_file and center, the model will treat the pdb_file as a already truncated pocket file, and use the center of the pdb_file as the center of the pocket')
@@ -77,7 +84,7 @@ if __name__ == '__main__':
     ckpt = torch.load(config.model.checkpoint , map_location=args.device)
     model = FragmentGeneration(ckpt['config'].model, protein_atom_feature_dim, \
                                 ligand_atom_feature_dim, frag_atom_feature_dim=45, num_edge_types=5,\
-                                num_classes=frag_base['data_base_smiles'].shape[0], pos_pred_type=ckpt['config'].model.pos_pred_type, num_classes=config.data.num_classes).to(args.device)
+                                num_classes=frag_base['data_base_smiles'].shape[0], pos_pred_type=ckpt['config'].model.pos_pred_type).to(args.device)
     
     print('Num of parameters is {0:.4}M'.format(np.sum([p.numel() for p in model.parameters()]) /100000 ))
     model.load_state_dict(ckpt['model'])
@@ -106,8 +113,32 @@ if __name__ == '__main__':
         return new_threshold
     sample_threshold = config.sample.threshold
     next_threshold = config.sample.next_threshold
-    # start to generate 
-    data_initial_list = get_init(model, pkt_data, frag_base, transform_ligand, sample_threshold,)
+    # start to generate
+    target_pos = None
+    if args.target_pos is not None:
+        target_pos = np.asarray([float(x.strip()) for x in args.target_pos.split(',')], dtype=np.float32)
+        if target_pos.shape != (3,):
+            raise ValueError('--target_pos must be a 3D coordinate in the format "x,y,z"')
+
+    if args.sdf_file is not None and osp.exists(args.sdf_file):
+        # Linker-design seed mode: bypass dictionary-based initialization and wrap the
+        # whole user-provided Fragment A as an indivisible anchor with a safe dummy id.
+        seed_mols = read_sdf(args.sdf_file)
+        if len(seed_mols) == 0:
+            raise ValueError(f'No molecule found in sdf_file: {args.sdf_file}')
+        seed_mol = seed_mols[0]
+        data_initial_list = [ComplexData(**{
+            'ligand_mol': seed_mol,
+            'current_wid': torch.tensor(0, dtype=torch.long),
+            'p_focal': torch.tensor(1.0),
+            'p_pos': torch.tensor(1.0),
+            'p_element': torch.tensor(1.0),
+            'p_all': torch.tensor(1.0),
+            'is_fragment': torch.tensor(1),
+            'status': 'running'
+        })]
+    else:
+        data_initial_list = get_init(model, pkt_data, frag_base, transform_ligand, sample_threshold,)
     # data_next_list = get_init_only_frag(model, data)
 
 
@@ -119,6 +150,13 @@ if __name__ == '__main__':
 
     pool.queue = data_initial_list
     random_sample_queue = False
+
+    def min_dist_to_target(ligand_mol, target):
+        if target is None:
+            return None
+        conf = ligand_mol.GetConformer()
+        xyz = np.asarray(conf.GetPositions(), dtype=np.float32)
+        return float(np.linalg.norm(xyz - target.reshape(1, 3), axis=1).min())
 
     global_step = 0 
     while len(pool.mols) < config.sample.num_samples:
@@ -142,13 +180,20 @@ if __name__ == '__main__':
             # assign the smiles to the data
             for data in data_next_list:
                 data['smiles'] = Chem.MolToSmiles(data['ligand_mol'])
+                dist_to_target = min_dist_to_target(data['ligand_mol'], target_pos)
+                if dist_to_target is not None:
+                    data['dist_to_target'] = torch.tensor(dist_to_target, dtype=torch.float32)
+                    # guided score: higher when getting closer to Frag B center
+                    data['p_all'] = data['p_all'] + torch.tensor(args.guidance_lambda / max(dist_to_target, 1e-3), dtype=torch.float32)
+                    if dist_to_target < args.target_finish_dist:
+                        data['status'] = 'finished'
             
             # data_next_list is the result of each data in the queue, 
             # here we iterate them to see whether they are finished, if not, we filter them for the next step queue
             for data_next in data_next_list: 
                 if data_next.status == 'finished':
-                    rdmol = data['ligand_mol']
-                    smiles = data['smiles']
+                    rdmol = data_next['ligand_mol']
+                    smiles = data_next['smiles']
                     if rdmol.GetNumAtoms() < 7: # The molecules are too small, it may generate outside the pocket
                         continue
                     if smiles in pool.smiles:
