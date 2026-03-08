@@ -45,6 +45,11 @@ if __name__ == '__main__':
     print('If you do not assign the sdf_file and center, the model will treat the pdb_file as a already truncated pocket file, and use the center of the pdb_file as the center of the pocket')
 
     config = load_config(args.config)
+
+    resolved_device = args.device
+    if args.device.startswith('cuda') and not torch.cuda.is_available():
+        print('[Warn] CUDA is not available. Falling back to CPU for sampling.')
+        resolved_device = 'cpu'
     
     saved_dir = osp.join(args.save_dir, osp.basename(args.sdf_file)[:-4])
     if not osp.exists(saved_dir):
@@ -80,22 +85,33 @@ if __name__ == '__main__':
     }
     print('The fragment database containing {} fragments has been loaded'.format(frag_base['data_base_smiles'].shape[0]))
 
-    # model loading 
-    ckpt = torch.load(config.model.checkpoint , map_location=args.device)
+    # model loading
+    # Load checkpoint on CPU first to avoid GPU OOM during deserialization.
+    ckpt = torch.load(config.model.checkpoint, map_location='cpu')
     model = FragmentGeneration(ckpt['config'].model, protein_atom_feature_dim, \
                                 ligand_atom_feature_dim, frag_atom_feature_dim=45, num_edge_types=5,\
-                                num_classes=frag_base['data_base_smiles'].shape[0], pos_pred_type=ckpt['config'].model.pos_pred_type).to(args.device)
-    
+                                num_classes=frag_base['data_base_smiles'].shape[0], pos_pred_type=ckpt['config'].model.pos_pred_type)
+
     print('Num of parameters is {0:.4}M'.format(np.sum([p.numel() for p in model.parameters()]) /100000 ))
     model.load_state_dict(ckpt['model'])
-    model = model.to(args.device)
+    try:
+        model = model.to(resolved_device)
+    except RuntimeError as e:
+        if 'out of memory' in str(e).lower() and resolved_device.startswith('cuda'):
+            print('[Warn] CUDA OOM while moving model to GPU. Falling back to CPU.')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            resolved_device = 'cpu'
+            model = model.to(resolved_device)
+        else:
+            raise
 
     # the model.pos_pred_type would determine how the neural geometry prediction is performed
     model.pos_pred_type = ckpt['config'].model.pos_pred_type
     print("The Nueral Geometry version is {}".format(model.pos_pred_type))
     # load the pocket data
 
-    pkt_data = transform(ply_to_pocket_data(args.surf_file)).to(args.device)
+    pkt_data = transform(ply_to_pocket_data(args.surf_file)).to(resolved_device)
     if config.model.pos_pred_type == 'geomopt':
         pkt_file = pocket_trunction(args.pdb_file, sdf_file = args.sdf_file)
         pkt_mol = Chem.MolFromPDBFile(pkt_file)
